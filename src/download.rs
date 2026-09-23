@@ -26,7 +26,11 @@ impl Downloader {
         Ok(Self { client })
     }
 
-    fn send(&self, url: &str) -> Result<Response> {
+    fn with_retries<T>(
+        &self,
+        url: &str,
+        mut consume: impl FnMut(Response) -> Result<T>,
+    ) -> Result<T> {
         let parsed = Url::parse(url).wrap_err_with(|| format!("invalid URL {url}"))?;
         let attempts = MAX_RETRIES + 1;
         let github_token = is_github_api_url(&parsed).then(github_token).flatten();
@@ -37,49 +41,53 @@ impl Downloader {
                 request = request.bearer_auth(token);
             }
 
-            match request.send() {
-                Ok(response)
-                    if response.status().is_success()
-                        || !is_retryable_status(response.status()) =>
-                {
-                    return Ok(response);
-                }
-                Ok(response) if attempt == attempts => return Ok(response),
+            let response = match request.send() {
+                Ok(response) => response,
                 Err(error) if attempt == attempts => {
                     return Err(error).wrap_err_with(|| format!("failed to GET {url}"));
                 }
-                Ok(_) | Err(_) => {
+                Err(_) => {
                     thread::sleep(Duration::from_millis(250 * u64::from(attempt)));
+                    continue;
                 }
+            };
+
+            if !response.status().is_success() {
+                if is_retryable_status(response.status()) && attempt < attempts {
+                    thread::sleep(Duration::from_millis(250 * u64::from(attempt)));
+                    continue;
+                }
+                bail!("failed to download {url}: HTTP {}", response.status());
+            }
+
+            match consume(response) {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt == attempts => {
+                    return Err(error).wrap_err_with(|| format!("failed to download {url}"));
+                }
+                Err(_) => thread::sleep(Duration::from_millis(250 * u64::from(attempt))),
             }
         }
 
         unreachable!("the retry loop always returns")
     }
 
-    fn send_ok(&self, url: &str) -> Result<Response> {
-        let response = self.send(url)?;
-        if !response.status().is_success() {
-            bail!("failed to download {url}: HTTP {}", response.status());
-        }
-        Ok(response)
-    }
-
     pub(crate) fn download_to_file(&self, url: &str, path: &Path) -> Result<()> {
-        let mut response = self.send_ok(url)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = File::create(path)?;
-        std::io::copy(&mut response, &mut file)?;
-        file.flush()?;
-        Ok(())
+        self.with_retries(url, |mut response| {
+            let mut file = File::create(path)?;
+            std::io::copy(&mut response, &mut file)?;
+            file.flush()?;
+            Ok(())
+        })
     }
 
     pub(crate) fn download_to_string(&self, url: &str) -> Result<String> {
-        self.send_ok(url)?
-            .text()
-            .wrap_err("failed to read response body")
+        self.with_retries(url, |response| {
+            response.text().wrap_err("failed to read response body")
+        })
     }
 }
 
@@ -92,7 +100,10 @@ fn github_token() -> Option<String> {
         .into_iter()
         .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
         .or_else(|| {
-            let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
+            let output = Command::new("gh")
+                .args(["auth", "token", "--hostname", "github.com"])
+                .output()
+                .ok()?;
             if !output.status.success() {
                 return None;
             }
@@ -156,6 +167,37 @@ pub(crate) fn extract_tar_gz_file(
 mod tests {
     use super::*;
 
+    fn truncated_then_complete_response(body: &'static [u8]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let _request_bytes = stream.read(&mut request).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                let response = if attempt == 0 {
+                    &body[..body.len() / 2]
+                } else {
+                    body
+                };
+                stream.write_all(response).unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn test_downloader() -> Downloader {
+        Downloader {
+            client: reqwest::blocking::Client::builder().build().unwrap(),
+        }
+    }
+
     #[test]
     fn retryable_statuses_are_limited() {
         for code in [403, 408, 429, 500, 502, 503, 504] {
@@ -164,6 +206,22 @@ mod tests {
         for code in [200, 400, 401, 404] {
             assert!(!is_retryable_status(StatusCode::from_u16(code).unwrap()));
         }
+    }
+
+    #[test]
+    fn retries_truncated_response_bodies() {
+        let body = b"complete response";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("download");
+        test_downloader()
+            .download_to_file(&truncated_then_complete_response(body), &path)
+            .unwrap();
+        assert_eq!(fs::read(path).unwrap(), body);
+
+        let downloaded = test_downloader()
+            .download_to_string(&truncated_then_complete_response(body))
+            .unwrap();
+        assert_eq!(downloaded.as_bytes(), body);
     }
 
     #[test]

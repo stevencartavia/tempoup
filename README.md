@@ -8,11 +8,14 @@ Installer and updater for [Tempo](https://tempo.xyz).
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/tempoxyz/tempoup/main/tempoup-init.sh | sh
 ```
 
-Then install the latest Tempo release:
+The bootstrap installs both `tempoup` and the latest Tempo release, and adds
+the installation directory to supported shell profiles. Afterwards, run:
 
 ```sh
 tempoup
 ```
+
+to install the latest Tempo release again.
 
 Use `tempoup --install v1.13.2` to install a specific release and
 `tempoup --update` to update tempoup itself.

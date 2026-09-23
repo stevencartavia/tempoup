@@ -14,27 +14,6 @@ fail() {
     exit 1
 }
 
-usage() {
-    cat <<EOF
-tempoup-init 0.1.0
-
-Install the tempoup binary.
-
-Usage: tempoup-init.sh [OPTIONS]
-
-Options:
-  -f, --force     Skip checksum verification (insecure)
-  -h, --help      Print help
-  -V, --version   Print version
-
-Environment variables:
-  TEMPOUP_VERSION              Install a specific tempoup version
-  TEMPOUP_IGNORE_VERIFICATION  Skip verification if set to true
-  TEMPO_BIN_DIR                Install directly into this directory
-  TEMPO_DIR                    Tempo directory (uses its bin subdirectory)
-EOF
-}
-
 download() {
     if command -v curl >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --silent --show-error --fail --location "$1" --output "$2"
@@ -83,14 +62,58 @@ architecture() {
     printf '%s_%s\n' "$platform" "$arch"
 }
 
-for arg in "$@"; do
-    case "$arg" in
-        -f | --force) TEMPOUP_IGNORE_VERIFICATION=true ;;
-        -h | --help) usage; exit 0 ;;
-        -V | --version) echo "tempoup-init 0.1.0"; exit 0 ;;
-        *) fail "unknown option: $arg" ;;
-    esac
-done
+add_shell_source() {
+    config=$1
+    source_file=$2
+    if [ -f "$config" ] && grep -F "$source_file" "$config" >/dev/null 2>&1; then
+        return
+    fi
+    mkdir -p "${config%/*}"
+    {
+        printf '\n# Added by tempoup installer\n'
+        printf '. "%s"\n' "$source_file"
+    } >> "$config"
+    say "added Tempo to PATH in $config"
+}
+
+configure_shell() {
+    shell_name=${SHELL:-}
+    shell_name=${shell_name##*/}
+    if [ -n "${ZDOTDIR:-}" ]; then
+        add_shell_source "$ZDOTDIR/.zshenv" "$env_file"
+    fi
+    if [ -f "$HOME/.zshenv" ] || [ "$shell_name" = zsh ]; then
+        add_shell_source "$HOME/.zshenv" "$env_file"
+    fi
+    if [ -f "$HOME/.bashrc" ] || [ "$shell_name" = bash ]; then
+        add_shell_source "$HOME/.bashrc" "$env_file"
+    fi
+    if [ -f "$HOME/.bash_profile" ]; then
+        add_shell_source "$HOME/.bash_profile" "$env_file"
+    fi
+    if [ -f "$HOME/.profile" ]; then
+        add_shell_source "$HOME/.profile" "$env_file"
+    fi
+
+    fish_config=${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/tempo.fish
+    if [ -d "${fish_config%/*}" ] || [ "$shell_name" = fish ]; then
+        if [ ! -f "$fish_config" ] || ! grep -F "$env_file.fish" "$fish_config" >/dev/null 2>&1; then
+            mkdir -p "${fish_config%/*}"
+            {
+                printf '# Added by tempoup installer\n'
+                printf 'source "%s"\n' "$env_file.fish"
+            } > "$fish_config"
+            say "added Tempo to PATH in $fish_config"
+        fi
+    fi
+}
+
+case "${1:-}" in
+    -f | --force)
+        TEMPOUP_IGNORE_VERIFICATION=true
+        shift
+        ;;
+esac
 
 target=$(architecture)
 asset="tempoup_$target"
@@ -103,15 +126,12 @@ else
     say "installing latest tempoup"
 fi
 
-if [ -n "${TEMPO_BIN_DIR:-}" ]; then
-    bin_dir=$TEMPO_BIN_DIR
-elif [ -n "${TEMPO_DIR:-}" ]; then
-    bin_dir=$TEMPO_DIR/bin
-else
-    bin_dir=$HOME/.tempo/bin
-fi
+tempo_dir=${TEMPO_DIR:-$HOME/.tempo}
+bin_dir=${TEMPO_BIN_DIR:-$tempo_dir/bin}
+env_file=$tempo_dir/env
 
-tmp=$(mktemp -d)
+mkdir -p "$bin_dir"
+tmp=$(mktemp -d "$bin_dir/.tempoup-init.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 binary=$tmp/tempoup
 expected=
@@ -149,14 +169,23 @@ fi
 
 chmod 755 "$binary"
 "$binary" --version >/dev/null || fail "downloaded tempoup binary could not run"
-mkdir -p "$bin_dir"
-staged=$bin_dir/.tempoup-new
-cp "$binary" "$staged"
-chmod 755 "$staged"
-mv "$staged" "$bin_dir/tempoup"
+mv "$binary" "$bin_dir/tempoup"
 
 say "tempoup installed to $bin_dir/tempoup"
-case ":${PATH:-}:" in
-    *":$bin_dir:"*) ;;
-    *) say "add $bin_dir to PATH" ;;
-esac
+mkdir -p "$tempo_dir"
+dollar='$'
+{
+    printf '# tempo shell setup\n'
+    printf 'export PATH="%s:%sPATH"\n' "$bin_dir" "$dollar"
+} > "$env_file"
+{
+    printf '# tempo shell setup\n'
+    printf 'fish_add_path -g "%s"\n' "$bin_dir"
+} > "$env_file.fish"
+configure_shell
+
+PATH=$bin_dir:${PATH:-}
+export PATH
+TEMPO_BIN_DIR=$bin_dir "$bin_dir/tempoup" "$@"
+
+say "restart your shell or run: source $env_file"

@@ -7,17 +7,21 @@ use sigstore_verify::{
     trust_root::{SIGSTORE_PRODUCTION_TRUSTED_ROOT, TrustedRoot},
     types::{Bundle, Sha256Hash},
 };
-use std::{fs, path::Path, thread, time::Duration};
+use std::{fs, path::Path, process::Command, thread, time::Duration};
 
 const GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
-const LEGACY_TEMPO_CUTOFF: Version = Version::new(1, 1, 2);
+const LEGACY_CHECKSUM_CUTOFF: Version = Version::new(1, 1, 2);
+const LEGACY_GPG_CUTOFF: Version = Version::new(1, 6, 0);
+const GPG_KEY_FINGERPRINT: &str = "EE3C5D41EA963E896F310EC3CBBFA54B20D33446";
+const GPG_KEY_URL: &str = "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xEE3C5D41EA963E896F310EC3CBBFA54B20D33446";
 const ATTESTATION_ATTEMPTS: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VerificationMethod {
     Unsafe,
     GitHubAttestation,
+    LegacyGpg,
     LegacyChecksumOnly,
 }
 
@@ -35,11 +39,61 @@ pub(crate) fn select_method(
         tag.strip_prefix('v')
             .ok_or_else(|| eyre::eyre!("invalid release tag {tag}"))?,
     )?;
-    if allow_legacy_tempo && version <= LEGACY_TEMPO_CUTOFF {
-        Ok(VerificationMethod::LegacyChecksumOnly)
-    } else {
-        Ok(VerificationMethod::GitHubAttestation)
+    if allow_legacy_tempo {
+        if version <= LEGACY_CHECKSUM_CUTOFF {
+            return Ok(VerificationMethod::LegacyChecksumOnly);
+        }
+        if version <= LEGACY_GPG_CUTOFF {
+            return Ok(VerificationMethod::LegacyGpg);
+        }
     }
+    Ok(VerificationMethod::GitHubAttestation)
+}
+
+pub(crate) fn verify_gpg_signature(
+    downloader: &Downloader,
+    artifact: &Path,
+    signature: &Path,
+) -> Result<()> {
+    let available = Command::new("gpg")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        bail!(
+            "this historical release requires GPG verification; install gpg or use --unsafe-skip-verify"
+        );
+    }
+
+    let has_key = || {
+        Command::new("gpg")
+            .args(["--batch", "--list-keys", GPG_KEY_FINGERPRINT])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    if !has_key() {
+        let key = tempfile::NamedTempFile::new()?;
+        downloader.download_to_file(GPG_KEY_URL, key.path())?;
+        let status = Command::new("gpg")
+            .arg("--batch")
+            .arg("--import")
+            .arg(key.path())
+            .status()?;
+        if !status.success() || !has_key() {
+            bail!("failed to import the Tempo release signing key");
+        }
+    }
+
+    let status = Command::new("gpg")
+        .args(["--batch", "--verify"])
+        .arg(signature)
+        .arg(artifact)
+        .status()?;
+    if !status.success() {
+        bail!("GPG signature verification failed; the binary may have been tampered with");
+    }
+    info("GPG signature verified ✓");
+    Ok(())
 }
 
 pub(crate) fn expected_checksum(checksum_file: &Path) -> Result<String> {
@@ -254,16 +308,20 @@ mod tests {
     #[test]
     fn verification_policy_only_grandfathers_known_legacy_tempo_releases() {
         assert_eq!(
+            select_method("v1.6.0", false, true).unwrap(),
+            VerificationMethod::LegacyGpg
+        );
+        assert_eq!(
+            select_method("v1.6.0", false, false).unwrap(),
+            VerificationMethod::GitHubAttestation
+        );
+        assert_eq!(
+            select_method("v1.7.0", false, true).unwrap(),
+            VerificationMethod::GitHubAttestation
+        );
+        assert_eq!(
             select_method("v1.1.2", false, true).unwrap(),
             VerificationMethod::LegacyChecksumOnly
-        );
-        assert_eq!(
-            select_method("v1.1.2", false, false).unwrap(),
-            VerificationMethod::GitHubAttestation
-        );
-        assert_eq!(
-            select_method("v1.1.3", false, true).unwrap(),
-            VerificationMethod::GitHubAttestation
         );
         assert_eq!(
             select_method("v0.1.0", false, false).unwrap(),
