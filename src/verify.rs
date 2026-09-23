@@ -65,35 +65,54 @@ pub(crate) fn verify_gpg_signature(
         );
     }
 
-    let has_key = || {
-        Command::new("gpg")
-            .args(["--batch", "--list-keys", GPG_KEY_FINGERPRINT])
-            .output()
-            .is_ok_and(|output| output.status.success())
-    };
-    if !has_key() {
-        let key = tempfile::NamedTempFile::new()?;
-        downloader.download_to_file(GPG_KEY_URL, key.path())?;
-        let status = Command::new("gpg")
-            .arg("--batch")
-            .arg("--import")
-            .arg(key.path())
-            .status()?;
-        if !status.success() || !has_key() {
-            bail!("failed to import the Tempo release signing key");
-        }
+    let keyring = tempfile::tempdir()?;
+    let key = keyring.path().join("tempo-release-key.asc");
+    downloader.download_to_file(GPG_KEY_URL, &key)?;
+    let imported = Command::new("gpg")
+        .args(["--no-options", "--batch", "--homedir"])
+        .arg(keyring.path())
+        .arg("--import")
+        .arg(&key)
+        .output()?;
+    if !imported.status.success() {
+        bail!("failed to import the Tempo release signing key");
     }
 
-    let status = Command::new("gpg")
-        .args(["--batch", "--verify"])
+    let verified = Command::new("gpg")
+        .args([
+            "--no-options",
+            "--batch",
+            "--no-auto-key-retrieve",
+            "--status-fd=1",
+            "--homedir",
+        ])
+        .arg(keyring.path())
+        .arg("--verify")
         .arg(signature)
         .arg(artifact)
-        .status()?;
-    if !status.success() {
+        .output()?;
+    if !verified.status.success()
+        || !validsig_matches(
+            &String::from_utf8_lossy(&verified.stdout),
+            GPG_KEY_FINGERPRINT,
+        )
+    {
         bail!("GPG signature verification failed; the binary may have been tampered with");
     }
     info("GPG signature verified ✓");
     Ok(())
+}
+
+fn validsig_matches(status_output: &str, expected_primary: &str) -> bool {
+    status_output.lines().any(|line| {
+        let Some(fields) = line.strip_prefix("[GNUPG:] VALIDSIG ") else {
+            return false;
+        };
+        let fields = fields.split_whitespace().collect::<Vec<_>>();
+        let signer = fields.first().copied();
+        let primary = fields.get(9).copied().or(signer);
+        primary.is_some_and(|fingerprint| fingerprint.eq_ignore_ascii_case(expected_primary))
+    })
 }
 
 pub(crate) fn expected_checksum(checksum_file: &Path) -> Result<String> {
@@ -328,6 +347,22 @@ mod tests {
             VerificationMethod::GitHubAttestation
         );
         assert!(select_method("nightly", false, true).is_err());
+    }
+
+    #[test]
+    fn gpg_status_must_name_the_pinned_primary_key() {
+        let primary = GPG_KEY_FINGERPRINT;
+        let subkey = "1234567890ABCDEF1234567890ABCDEF12345678";
+        let status = format!("[GNUPG:] VALIDSIG {subkey} 2026-01-01 0 0 4 0 22 8 00 {primary}\n");
+        assert!(validsig_matches(&status, primary));
+        assert!(!validsig_matches(
+            &status,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
+        assert!(validsig_matches(
+            &format!("[GNUPG:] VALIDSIG {primary} 2026-01-01 0 0 4 0 22 8 00\n"),
+            primary
+        ));
     }
 
     #[test]

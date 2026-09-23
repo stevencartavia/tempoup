@@ -16,12 +16,74 @@ fail() {
 
 download() {
     if command -v curl >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --silent --show-error --fail --location "$1" --output "$2"
+        download_client=curl
     elif command -v wget >/dev/null 2>&1; then
-        wget --https-only --secure-protocol=TLSv1_2 --tries=6 --quiet "$1" -O "$2"
+        download_client=wget
     else
         fail "curl or wget is required"
     fi
+
+    download_max_retries=$(awk -v value="${TEMPOUP_MAX_RETRIES:-}" 'BEGIN {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        if (value ~ /^[+]?[0-9]+$/ && value + 0 <= 4294967295) {
+            if (value + 0 > 10) value = 10
+            printf "%.0f\n", value
+        } else print 5
+    }')
+    download_attempt=0
+    download_delay=1
+    download_host=${1#https://}
+    download_host=${download_host%%/*}
+    download_host=${download_host%%:*}
+    download_host=${download_host%.}
+
+    while :; do
+        download_http_status=
+        if [ "$download_client" = curl ]; then
+            if download_http_status=$(curl --proto '=https' --tlsv1.2 --silent --show-error --fail --location \
+                --write-out '%{http_code}' "$1" --output "$2"); then
+                return 0
+            else
+                download_status=$?
+            fi
+        else
+            if download_error=$(LC_ALL=C wget --https-only --secure-protocol=TLSv1_2 \
+                --server-response --tries=1 "$1" -O "$2" 2>&1); then
+                return 0
+            else
+                download_status=$?
+            fi
+            download_http_status=$(printf '%s\n' "$download_error" |
+                awk '$1 ~ /^HTTP\// { code=$2 } END { print code }')
+            printf '%s\n' "$download_error" >&2
+        fi
+
+        download_retryable=false
+        case "$download_client:$download_status" in
+            curl:22|wget:8)
+                case "$download_http_status" in
+                    403|408|429|500|502|503|504) download_retryable=true ;;
+                esac
+                ;;
+            curl:5|curl:6|curl:7|curl:16|curl:18|curl:28|curl:52|curl:55|curl:56|curl:92|wget:4)
+                download_retryable=true
+                ;;
+        esac
+        case "$download_host" in
+            github.com|*.github.com|githubusercontent.com|*.githubusercontent.com) ;;
+            *) download_retryable=false ;;
+        esac
+        if [ "$download_retryable" = false ] || [ "$download_attempt" -ge "$download_max_retries" ]; then
+            return "$download_status"
+        fi
+
+        download_attempt=$((download_attempt + 1))
+        say "download failed; retrying in ${download_delay}s (${download_attempt}/${download_max_retries})" >&2
+        sleep "$download_delay"
+        if [ "$download_delay" -lt 16 ]; then
+            download_delay=$((download_delay * 2))
+        fi
+    done
 }
 
 sha256() {

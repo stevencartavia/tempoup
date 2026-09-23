@@ -4,8 +4,11 @@ use crate::{
     platform::Target,
 };
 use eyre::{Context, Result, bail};
+use reqwest::Url;
 use semver::Version;
 use serde::Deserialize;
+
+const MAX_RELEASE_PAGES: usize = 100;
 
 #[derive(Deserialize)]
 pub(crate) struct Asset {
@@ -70,17 +73,28 @@ pub(crate) fn resolve_tempo_release(
 }
 
 pub(crate) fn resolve_latest_tempoup_release(downloader: &Downloader) -> Result<Release> {
-    latest_tempoup_release(list_releases(downloader, TEMPOUP_REPO)?)
-        .ok_or_else(|| eyre::eyre!("could not find a published tempoup release"))
-}
+    let public_url = format!("https://github.com/{TEMPOUP_REPO}/releases/latest");
+    if let Ok(final_url) = downloader.resolve_redirect_url(&public_url) {
+        if let Some(tag_name) = tag_from_release_url(&final_url, TEMPOUP_REPO) {
+            return Ok(Release {
+                tag_name,
+                draft: false,
+                prerelease: false,
+                assets: Vec::new(),
+            });
+        }
+    }
 
-fn latest_tempoup_release(releases: Vec<Release>) -> Option<Release> {
-    releases
-        .into_iter()
-        .filter(|release| !release.draft && !release.prerelease)
-        .filter_map(|release| tempoup_version(&release.tag_name).map(|version| (version, release)))
-        .max_by(|(left, _), (right, _)| left.cmp(right))
-        .map(|(_, release)| release)
+    let url = format!("https://api.github.com/repos/{TEMPOUP_REPO}/releases/latest");
+    let body = downloader
+        .download_to_string(&url)
+        .wrap_err("could not resolve the latest published tempoup release")?;
+    let release: Release =
+        serde_json::from_str(&body).wrap_err("invalid GitHub release response")?;
+    if release.draft || release.prerelease || tempoup_version(&release.tag_name).is_none() {
+        bail!("GitHub returned an invalid latest tempoup release");
+    }
+    Ok(release)
 }
 
 fn fetch_release(downloader: &Downloader, repository: &str, tag: &str) -> Result<Release> {
@@ -103,9 +117,48 @@ fn fetch_release(downloader: &Downloader, repository: &str, tag: &str) -> Result
 }
 
 fn list_releases(downloader: &Downloader, repository: &str) -> Result<Vec<Release>> {
-    let url = format!("https://api.github.com/repos/{repository}/releases?per_page=100");
-    let body = downloader.download_to_string(&url)?;
-    serde_json::from_str(&body).wrap_err("invalid GitHub releases response")
+    let url = format!("https://api.github.com/repos/{repository}/releases");
+    list_release_pages(downloader, &url, 100)
+}
+
+fn list_release_pages(
+    downloader: &Downloader,
+    base_url: &str,
+    per_page: usize,
+) -> Result<Vec<Release>> {
+    let mut releases = Vec::new();
+    for page_number in 1..=MAX_RELEASE_PAGES {
+        let url = format!("{base_url}?per_page={per_page}&page={page_number}");
+        let body = downloader.download_to_string(&url)?;
+        let mut page: Vec<Release> =
+            serde_json::from_str(&body).wrap_err("invalid GitHub releases response")?;
+        let is_last_page = page.len() < per_page;
+        releases.append(&mut page);
+        if is_last_page {
+            return Ok(releases);
+        }
+    }
+    bail!("GitHub release pagination exceeded {MAX_RELEASE_PAGES} pages")
+}
+
+fn tag_from_release_url(url: &Url, repository: &str) -> Option<String> {
+    let (owner, name) = repository.split_once('/')?;
+    if url.scheme() != "https"
+        || url.host_str()? != "github.com"
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    let [actual_owner, actual_name, "releases", "tag", tag] = segments.as_slice() else {
+        return None;
+    };
+    (*actual_owner == owner && *actual_name == name && tempoup_version(tag).is_some())
+        .then(|| (*tag).to_string())
 }
 
 fn is_stable_tempo_release(release: &Release) -> bool {
@@ -135,6 +188,7 @@ pub(crate) fn tempoup_version(tag: &str) -> Option<Version> {
 mod tests {
     use super::*;
     use crate::platform::{Arch, Platform};
+    use std::io::{Read, Write};
 
     fn release(tag: &str, draft: bool, prerelease: bool) -> Release {
         Release {
@@ -199,19 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn latest_tempoup_uses_independent_semver_tags() {
-        let releases = vec![
-            release("v0.1.0", false, false),
-            release("tempoup-v99.0.0", false, false),
-            release("v0.3.0", true, false),
-            release("v0.4.0-rc.1", false, false),
-            release("v0.4.0+build.1", false, false),
-            release("v0.2.0", false, false),
-        ];
-        assert_eq!(latest_tempoup_release(releases).unwrap().tag_name, "v0.2.0");
-    }
-
-    #[test]
     fn latest_tempo_uses_semver_instead_of_api_order() {
         let releases = vec![
             release("v0.1.0", false, false),
@@ -220,5 +261,58 @@ mod tests {
             release("v2.0.0-rc.1", false, false),
         ];
         assert_eq!(latest_tempo_release(releases).unwrap().tag_name, "v1.13.2");
+    }
+
+    #[test]
+    fn latest_release_url_requires_the_expected_repository_and_stable_tag() {
+        let parse = |url| tag_from_release_url(&Url::parse(url).unwrap(), TEMPOUP_REPO);
+        assert_eq!(
+            parse("https://github.com/tempoxyz/tempoup/releases/tag/v1.2.3").as_deref(),
+            Some("v1.2.3")
+        );
+        assert_eq!(
+            parse("https://github.com/attacker/tempoup/releases/tag/v1.2.3"),
+            None
+        );
+        assert_eq!(
+            parse("https://github.com/tempoxyz/tempoup/releases/tag/v1.2.3-rc.1"),
+            None
+        );
+        assert_eq!(
+            parse("https://github.com/tempoxyz/tempoup/releases/tag/v1.2.3?x=1"),
+            None
+        );
+    }
+
+    #[test]
+    fn release_enumeration_follows_next_page() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for page in 1..=2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(request.contains(if page == 1 { "page=1" } else { "page=2" }));
+                assert!(request.contains("per_page=2"));
+                let body = if page == 1 {
+                    r#"[{"tag_name":"crate@99.0.0","draft":false,"prerelease":false,"assets":[]},{"tag_name":"v2.0.0-rc.1","draft":false,"prerelease":true,"assets":[]}]"#
+                } else {
+                    r#"[{"tag_name":"v1.14.0","draft":false,"prerelease":false,"assets":[]}]"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let downloader = Downloader::test();
+        let releases =
+            list_release_pages(&downloader, &format!("http://{address}/releases"), 2).unwrap();
+        assert_eq!(latest_tempo_release(releases).unwrap().tag_name, "v1.14.0");
     }
 }

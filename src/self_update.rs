@@ -38,7 +38,6 @@ pub(crate) fn run(config: &Config, unsafe_skip_verify: bool) -> Result<()> {
     let binary_name = tempoup_binary_name(target);
     let attestation_name = tempoup_attestation_name(target);
     let method = select_method(&release.tag_name, unsafe_skip_verify, false)?;
-    release.require_assets(&[binary_name.as_str(), attestation_name.as_str()])?;
 
     let workspace = tempfile::Builder::new()
         .prefix(".tempoup-self-update-")
